@@ -1,0 +1,16 @@
+[Unit]
+Description=Challenger cooler display (CPU temp + fan RPM)
+After=systemd-modules-load.service
+
+[Service]
+ExecStart=/usr/local/bin/challenger --temp-sensor k10temp/temp1 --fan-sensor it8689/fan1
+Restart=always
+RestartSec=5
+# root is only needed to open /dev/hidraw; lock everything else down
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
