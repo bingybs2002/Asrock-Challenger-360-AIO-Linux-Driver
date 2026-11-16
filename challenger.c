@@ -9,9 +9,13 @@
  */
 #define _GNU_SOURCE /* memmem */
 #include <fcntl.h>
+#include <errno.h>
 #include <getopt.h>
 #include <glob.h>
+#include <signal.h>
 #include <linux/hidraw.h>
+#include <linux/usbdevice_fs.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,6 +91,8 @@ static int read_file(const char *path, char *buf, size_t len)
     return (int)n;
 }
 
+static char dev_sysfs[512]; /* /sys/class/hidraw/hidrawN of the last device found, for usb_reset() */
+
 /* The cooler exposes several hidraw nodes; pick the one whose report descriptor has usage page 0xFF01. */
 static int open_device(void)
 {
@@ -112,11 +118,47 @@ static int open_device(void)
         int n = read_file(path, buf, sizeof buf);
         if (n < 3 || !memmem(buf, n, USAGE_PAGE_FF01, 3))
             continue;
+        snprintf(dev_sysfs, sizeof dev_sysfs, "%s", g.gl_pathv[i]);
         snprintf(path, sizeof path, "/dev/%s", strrchr(g.gl_pathv[i], '/') + 1);
         fd = open(path, O_RDWR);
     }
     globfree(&g);
     return fd;
+}
+
+/* After a long idle the cooler's firmware can wedge: every SET_FEATURE stalls (EPROTO) and reopening
+ * hidraw doesn't help, but a USB port reset does. hidrawN/device -> .../1-7/1-7:1.1/0003:..., so the
+ * USB device is two levels up. */
+static int usb_reset(void)
+{
+    char path[PATH_MAX], buf[32];
+    unsigned bus, dev;
+    if (!dev_sysfs[0])
+        return -1;
+    char link[600];
+    snprintf(link, sizeof link, "%s/device", dev_sysfs);
+    if (!realpath(link, path))
+        return -1;
+    for (int up = 0; up < 2; up++) {
+        char *s = strrchr(path, '/');
+        if (!s)
+            return -1;
+        *s = 0;
+    }
+    char attr[PATH_MAX + 16];
+    snprintf(attr, sizeof attr, "%s/busnum", path);
+    if (read_file(attr, buf, sizeof buf) <= 0 || sscanf(buf, "%u", &bus) != 1)
+        return -1;
+    snprintf(attr, sizeof attr, "%s/devnum", path);
+    if (read_file(attr, buf, sizeof buf) <= 0 || sscanf(buf, "%u", &dev) != 1)
+        return -1;
+    snprintf(attr, sizeof attr, "/dev/bus/usb/%03u/%03u", bus, dev);
+    int fd = open(attr, O_WRONLY);
+    if (fd < 0)
+        return -1;
+    int rc = ioctl(fd, USBDEVFS_RESET, 0);
+    close(fd);
+    return rc;
 }
 
 static int send_frame(int fd, uint8_t f[5][PKT_LEN])
@@ -240,20 +282,38 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* live: reopen the device whenever it disappears (unplug, boot ordering) */
-    int fd = -1, warned_dev = 0;
+    /* live: never exit. Reopen the device whenever it disappears or another program makes it
+     * fail (unplug, boot ordering, vendor/RGB tools); missing sensors just show 0 until they return. */
+    signal(SIGPIPE, SIG_IGN); /* a closed stderr pipe must not kill us */
+    int fd = -1, warned_dev = 0, send_fails = 0;
+    time_t last_reset = 0;
     for (;;) {
         read_sensors(temp_spec, fan_spec, &temp, &rpm);
         build_frame(f, temp, rpm, fahrenheit);
         if (fd < 0)
             fd = open_device();
         if (fd >= 0 && send_frame(fd, f) == 0) {
+            if (warned_dev)
+                fprintf(stderr, "Challenger device recovered\n");
             warned_dev = 0;
+            send_fails = 0;
         } else {
             if (!warned_dev++)
-                fprintf(stderr, "Challenger device not available, retrying\n");
-            if (fd >= 0)
+                fprintf(stderr, "Challenger device not available (%s), retrying\n", strerror(errno));
+            if (fd >= 0) {
                 close(fd);
+                /* device is present but rejecting writes: after a few tries, reset it (at most every 30 s) */
+                time_t now = time(NULL);
+                if (++send_fails >= 3 && now - last_reset >= 30) {
+                    last_reset = now;
+                    send_fails = 0;
+                    if (usb_reset() == 0)
+                        fprintf(stderr, "Challenger device stuck, USB reset done\n");
+                    else
+                        fprintf(stderr, "Challenger device stuck, USB reset failed (%s)\n", strerror(errno));
+                    sleep(2); /* let it re-enumerate */
+                }
+            }
             fd = -1;
         }
         sleep(1);

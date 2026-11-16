@@ -143,37 +143,53 @@ def hwmon_read(spec):
                     continue
             with open(f"{h}/{attr}_input") as f:
                 return int(f.read())
-        except OSError:
+        except (OSError, ValueError):  # busy / empty / garbage read: try other chips, else fail
             continue
     raise LookupError(f"sensor {spec} not found")
 
 
 def live(temp_spec, fan_spec, fahrenheit):
+    """Loop forever: any failure (sensor busy/missing, device unplugged or grabbed by another
+    program, unexpected exception) is logged once and retried on the next tick. Only Ctrl-C exits."""
     dev = None
+    last_err = {}  # source -> last message, so a persistent failure is logged once, not every second
+
+    def report(src, err):
+        msg = f"{src}: {err}" if err else None
+        if last_err.get(src) != msg:
+            if msg:
+                print(msg, file=sys.stderr, flush=True)
+            elif src in last_err:
+                print(f"{src}: recovered", file=sys.stderr, flush=True)
+            last_err[src] = msg
+
+    def read(spec):
+        try:
+            v = hwmon_read(spec)
+            report(spec, None)
+            return v
+        except Exception as e:  # not found, EIO/EBUSY while another reader holds it, garbage value...
+            report(spec, e)
+            return 0
+
     while True:
         try:
-            temp = hwmon_read(temp_spec) / 1000
-        except LookupError as e:
-            temp = 0
-            print(e, file=sys.stderr)
-        try:
-            rpm = hwmon_read(fan_spec)
-        except LookupError as e:
-            rpm = 0
-            print(e, file=sys.stderr)
-        frame = build_frame(cpu_temp=temp, rpm=rpm, fahrenheit=fahrenheit, mode=2)
-        try:
+            frame = build_frame(cpu_temp=read(temp_spec) / 1000, rpm=read(fan_spec),
+                                fahrenheit=fahrenheit, mode=2)
             if dev is None:
                 dev = open_device()
             for p in frame:
                 dev.send_feature_report(p)
                 time.sleep(0.01)
-        except (OSError, SystemExit) as e:  # unplugged / not yet present: retry next tick
-            print(f"device: {e}", file=sys.stderr)
+            report("device", None)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:  # incl. SystemExit from open_device when not found
+            report("device", str(e) or type(e).__name__)
             if dev is not None:
                 try:
                     dev.close()
-                except OSError:
+                except Exception:
                     pass
             dev = None
         time.sleep(1)
